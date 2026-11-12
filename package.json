@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-dedide-ercorrection",
   "description": "中文「的/地/得」混用纠错 for Koishi：本地 ONNX 模型，无需联网、无需 LLM，@人/表情占位符保留",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -21,7 +21,7 @@
     "build": "tsc -p tsconfig.json && esbuild src/index.ts --bundle --platform=node --format=cjs --target=node20 --external:koishi --external:@azulores/de-corrector --outfile=lib/index.js"
   },
   "dependencies": {
-    "@azulores/de-corrector": "^0.1.2"
+    "@azulores/de-corrector": "^0.1.3"
   },
   "peerDependencies": {
     "koishi": "^4.18.11"
