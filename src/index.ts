@@ -14,7 +14,7 @@
 //   plain  —— 直接发修正后的完整文本（旧行为）
 //   quote  —— 引用原消息 + 修正后的完整文本（无 @）
 //   auto   —— 短消息（≤ fullTextThreshold）：同 quote；
-//             长消息：引用原消息 + 只发错误位置上下文片段（错误处标 [地→的]，
+//             长消息：引用原消息 + 只发错误位置上下文片段（错误处标 〔地→的〕，
 //             相邻错误（≤ quoteContextChars）自动合并为一段，不会隐藏）
 import { Schema, Context, Session, h } from 'koishi'
 import { DeCorrector } from './corrector/de-corrector.js'
@@ -85,7 +85,7 @@ interface Change { index: number; from: string; to: string; tag?: string }
 
 /**
  * 长消息片段：把 changes（按 clean 文本的码点 index）按相邻关系分组，
- * 每组取「首错前 ctxLen 字 ~ 末错后 ctxLen 字」的窗口，错误字渲染成半角 [地→的]。
+ * 每组取「首错前 ctxLen 字 ~ 末错后 ctxLen 字」的窗口，错误字渲染成六角括号 〔地→的〕。
  * 相邻错误（间隔 ≤ ctxLen）自动并进同一段完整展示，不会被省略号藏掉。
  */
 function buildSnippets(chars: string[], changes: Change[], ctxLen: number): string[] {
@@ -103,7 +103,7 @@ function buildSnippets(chars: string[], changes: Change[], ctxLen: number): stri
     let body = ''
     let pos = start
     for (const c of g) {
-      body += chars.slice(pos, c.index).join('') + `[${c.from}→${c.to}]`
+      body += chars.slice(pos, c.index).join('') + `〔${c.from}→${c.to}〕`
       pos = c.index + 1
     }
     body += chars.slice(pos, end).join('')
@@ -114,7 +114,7 @@ function buildSnippets(chars: string[], changes: Change[], ctxLen: number): stri
 // 供沙盒测试直接调用片段逻辑（不进入公共 API 面）
 export const __test = { buildSnippets, markChanges }
 
-/** 把 changes（clean 文本的码点 index）映射回加回占位符后的 restored 索引，并在原位渲染成半角 [原→修] */
+/** 把 changes（clean 文本的码点 index）映射回加回占位符后的 restored 索引，并在原位渲染成六角括号 〔原→修〕 */
 function markChanges(
   restored: string,
   changes: Change[],
@@ -126,7 +126,7 @@ function markChanges(
     for (const { content, pos } of items) {
       if (c.index >= pos) delta += content.length
     }
-    return { index: c.index + delta, text: `[${c.from}→${c.to}]` }
+    return { index: c.index + delta, text: `〔${c.from}→${c.to}〕` }
   })
   // 从后往前替换，避免位移影响后面的索引
   mapped.sort((a, b) => b.index - a.index)
@@ -242,7 +242,7 @@ export function apply(ctx: Context, config: Config) {
     }
 
     // quote / auto：显式发送「引用原消息 + 正文」，正文不含 at
-    // 短消息：发完整修正文本，并在改错处标半角 [原→修]
+    // 短消息：发完整修正文本，并在改错处标六角括号 〔原→修〕
     // 长消息：只发错误位置上下文片段（同标记，带 … 截断，相邻错误合并）
     const body = useSnippet && r.changes.length
       ? buildSnippets(r.chars, r.changes, ctxLen).join('\n')
