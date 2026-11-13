@@ -68,6 +68,21 @@ function neighborTag(chars, tags, i, step) {
  */
 const INTRANS_VERBS = new Set([...'飞跑跳走游哭睡长来去爬滚坐站蹲飘落转'])
 
+/**
+ * 程度补语固定后缀（F1）：`X的 + 后缀` → `X得…`。
+ * 仅在标签不可靠（DEG/SP/DEC）时强改，正常的 DER/DEV 不碰。
+ */
+const DEGREE_SUFFIXES = ['离谱', '要死', '犯规', '不可以', '不行', '要命', '不得了', '要疯']
+
+/**
+ * 网络俚语形容词：模型常判成 NN（如「菜」），单靠词性标签救不了，
+ * 需配合后文模式（离谱/犯规/一批…）判定。只收高置信度的单字。
+ */
+const SLANG_ADJ = new Set([...'菜萌猛秀骚弱强快慢高矮胖瘦帅丑美烂棒惨酷拽绝香臭甜苦辣酸咸贵贱'])
+
+/** 可作程度补语中心的词性 */
+const DEGREE_ADJ_TAGS = new Set(['VA', 'JJ', 'VV'])
+
 /** 是否处于分句开头（串首，或前一个字是标点/空白） */
 function isClauseStart(chars, pos) {
   if (pos <= 0) return true
@@ -93,6 +108,9 @@ export const FROZEN_WORDS = [
   '众矢之的', '一语中的', '有的放矢',
   // 固定说法（逐字模型会误把「总的」标成 DEV → 地，必须保护）
   '总的来说', '总的来说吧',
+  // 副词性固定说法（逐字输入看不到词边界，模型会把「真的」标成 DEV → 误改「真地」；
+  // 实测长文本上下文下分词也不稳定，冻结是唯一可靠护栏）
+  '真的',
   // 含「地」
   '土地', '地方', '地址', '地区', '地铁', '地图', '地球', '地面', '地点',
   '地位', '地域', '地基', '地毯', '地道', '地下', '地狱', '地板', '地主',
@@ -106,6 +124,8 @@ export const FROZEN_WORDS = [
   '记得', '懂得', '难得', '值得', '显得', '免得', '使得', '不得', '所得',
   '心得', '见得', '舍得', '晓得', '认得', '赢得', '求得', '博得', '夺得',
   '总得', '必得', '只得', '自得', '相得益彰',
+  // 副词性固定说法（同上：逐字模型把「不由得」的得标成 DEV → 误改「不由地」）
+  '不由得',
 ]
 
 const PUNCT = '，。！？；：、“”‘’（）《》〈〉【】…—～,.!?;:\'"()[]{}<>-~ \n\t\r'
@@ -118,6 +138,126 @@ const MIN_CONTENT_RUN = 2
 
 /** 模型最大位置数（含 [CLS]/[SEP]） */
 const MAX_LEN = 510
+
+// ────────────────────────────────────────────────────────────
+// 长消息分块（chunking）
+//
+// 本引擎逐字输入：1 字 = 1 token（vocab 按单字查，无 subword 膨胀），
+// 但 MAX_LEN=510 是硬上限，且 maxLength（默认 500）此前是「全文熔断」——
+// 超长消息被整条静默跳过（生产事故 2026-11-13，503 字消息无人处理）。
+// 解法：按句界切块、逐块推理、块偏移合并。切块只影响模型看到的上下文
+// 窗口（接缝处标签质量略降），不改变「1:1 单字替换」的纠错语义。
+// ────────────────────────────────────────────────────────────
+
+/** 块目标大小（给 [CLS]/[SEP] 与边界留余量，≤ MAX_LEN-2） */
+const CHUNK_TARGET = 300
+
+/** 强制切分的句终标点（优先级 1）；句内标点（优先级 2）兜底 */
+const SENT_END = new Set([...'。！？；…\n'])
+const CLAUSE_END = new Set([...'，、：'])
+
+/** 占位符形态：块边界绝不能切进这些结构内部 */
+const PLACEHOLDER_RE = /(<[^<>]{0,120}>|\[[^\]\[]{0,120}\])/g
+
+/**
+ * 找出所有占位符区间（闭区间 [s,e]，码点坐标），切块时整体跳过。
+ * 引擎消费者（如 koishi 插件）通常已在调用前抽出占位符，这里是对
+ * 其他消费者的兜底保护：切进 <at .../> 内部不会破坏文本（我们只改
+ * 的地得），但会让模型看到半截标签，白费上下文。
+ */
+function placeholderSpans(chars) {
+  const spans = []
+  const text = chars.join('')
+  for (const m of text.matchAll(PLACEHOLDER_RE)) {
+    // 字符串下标 → 码点下标
+    const s = [...text.slice(0, m.index)].length
+    spans.push([s, s + [...m[0]].length])
+  }
+  return spans
+}
+
+/**
+ * 句界优先的贪心切块。
+ *
+ * 规则（工作单 §3）：
+ * 1. 按 SENT_END 切句；单句仍超 target 时按 CLAUSE_END 兜底，再超就硬切。
+ * 2. 贪心攒块：相邻句子相加 ≤ target 就并进当前块（不回退）。
+ * 3. 边界落在占位符内部 → 后移到占位符结束。
+ * 4. 硬切只在「整段无任何标点且超 target」时发生。
+ *
+ * @param {string[]} chars 码点数组
+ * @param {number} target 每块目标码点数
+ * @returns {Array<[number,number]>} 各块 [start,end) 区间（码点坐标）
+ */
+export function chunkBySentence(chars, target = CHUNK_TARGET) {
+  if (chars.length <= target) return [[0, chars.length]]
+
+  // 第一步：句级切分
+  const sentences = []
+  let s = 0
+  for (let i = 0; i < chars.length; i++) {
+    if (SENT_END.has(chars[i])) {
+      sentences.push([s, i + 1])
+      s = i + 1
+    }
+  }
+  if (s < chars.length) sentences.push([s, chars.length])
+
+  // 第二步：超长单句降级（句内标点 → 硬切），产出不超过 target 的最小单元
+  const units = []
+  for (const [ss, se] of sentences) {
+    if (se - ss <= target) {
+      units.push([ss, se])
+      continue
+    }
+    let u = ss
+    for (let i = ss; i < se; i++) {
+      if (CLAUSE_END.has(chars[i])) {
+        units.push([u, i + 1])
+        u = i + 1
+      }
+    }
+    if (u < se) units.push([u, se])
+  }
+  // 连续无标点、子句仍超 target 的极端情况 → 硬切
+  const sized = []
+  for (const [a, b] of units) {
+    for (let k = a; k < b; k += target) sized.push([k, Math.min(k + target, b)])
+  }
+
+  // 第三步：占位符边界保护 + 贪心合并
+  const spans = placeholderSpans(chars)
+  const inPlaceholder = (i) => spans.some(([a, b]) => i > a && i < b)
+
+  const chunks = []
+  let curStart = -1
+  let curLen = 0
+  for (const [us, ue] of sized) {
+    const len = ue - us
+    if (curStart < 0) {
+      curStart = us
+      curLen = len
+    } else if (curLen + len <= target) {
+      curLen += len
+    } else {
+      chunks.push([curStart, curStart + curLen])
+      curStart = us
+      curLen = len
+    }
+  }
+  if (curStart >= 0) chunks.push([curStart, curStart + curLen])
+
+  // 贪心合并后的块尾若落在占位符内部，后移到占位符结束
+  for (let k = 0; k < chunks.length - 1; k++) {
+    let end = chunks[k][1]
+    while (end < chars.length && inPlaceholder(end)) end++
+    if (end !== chunks[k][1]) {
+      chunks[k + 1][0] = end
+      chunks[k][1] = end
+    }
+  }
+  return chunks
+}
 
 function effectiveChars(text) {
   return [...text].filter((c) => !PUNCT.includes(c))
@@ -186,7 +326,18 @@ export class DeCorrector {
   #frozenSet
 
   constructor(options = {}) {
+    // maxLength 语义（0.2.0 起）：**单块**字符上限。超过不再整条丢弃，
+    // 而是分块处理（见 chunkBySentence）。0 = 不限制。
     this.maxLength = options.maxLength ?? 500
+    // 全文熔断：超过此字符数整条跳过（防性能滥用，保持旧的"超长丢弃"兜底）
+    this.maxTotalLength = options.maxTotalLength ?? 2000
+    // 块数上限：超出部分**原样保留**（不丢文本），并可通过 onChunk 观测
+    this.maxChunks = options.maxChunks ?? 4
+    // 分块目标大小（码点）。块越大上下文越好、块数越少；默认 300。
+    this.chunkTarget = options.chunkTarget ?? CHUNK_TARGET
+    // 分块观测回调：({ total, chunks: [[s,e],...], processed, skipped })，
+    // 消费者（如 koishi 插件）用它打日志/计数，引擎自身不落任何日志
+    this.onChunk = options.onChunk ?? null
     this.modelPath = options.modelPath ?? join(ASSETS, 'model.onnx')
     this.debug = options.debug ?? false
     this.assetsDir = ASSETS
@@ -264,22 +415,23 @@ export class DeCorrector {
   }
 
   /**
-   * 检查文本，返回纠错结果。
-   * @returns {{text:string, corrected:string, changes:Array, tags:Array}}
+   * 检查文本，返回纠错结果。任意长度：超过单块上限自动分块（0.2.0 起），
+   * 不再整条丢弃。changes[].index 始终是**全文码点下标**。
+   * @returns {{text:string, corrected:string, changes:Array, tags:Array, chunkInfo?:object}}
    */
   async check(text) {
     const chars = [...(text ?? '')]
     const empty = { text, corrected: text ?? '', changes: [], tags: [] }
     if (!chars.length) return empty
     if (!chars.some((c) => '的地得'.includes(c))) return empty
-    // 长度限制（超长直接跳过，避免长消息拖慢）
-    if (this.maxLength > 0 && chars.length > this.maxLength) return empty
+    // 全文熔断（防性能滥用；此前这里是 maxLength 整条丢弃，事故根源）
+    if (this.maxTotalLength > 0 && chars.length > this.maxTotalLength) return empty
     // 整段纯乱打 → 跳过
     if (!hasRealContent(text)) return empty
 
     const changes = []
-    // 0) 固定短语强改（同长度替换，偏移不变）——必须在 #pos 之前，
-    //    让模型看到改后的文本，避免它再把「总的来说」判成 DEV→地。
+    // 0) 固定短语强改（同长度替换，偏移不变）——必须在 #pos 之前、
+    //    分块之前全局做：模型看到改后的文本，短语也不会被块边界切碎。
     for (let i = 0; i < chars.length; i++) {
       const forced = phraseOverride(chars, i)
       if (forced && forced !== chars[i]) {
@@ -287,78 +439,172 @@ export class DeCorrector {
         chars[i] = forced
       }
     }
+    const forcedIdx = new Set(changes.map((c) => c.index))
 
-    const tags = await this.#pos(chars)
+    // 分块：一块放得下（≤ min(maxLength, MAX_LEN-2)）→ 单块直达，
+    // 行为与 0.1.x 完全一致（绝大多数消息走这条路）；否则句界分块。
+    const perChunkCap = this.maxLength > 0 ? Math.min(this.maxLength, MAX_LEN - 2) : MAX_LEN - 2
+    let ranges
+    if (chars.length <= perChunkCap) {
+      ranges = [[0, chars.length]]
+    } else {
+      ranges = chunkBySentence(chars, Math.min(perChunkCap, this.chunkTarget))
+      // 句界分块后仍可能有超长块（连续无标点超过 cap）→ 硬切兜底
+      ranges = ranges.flatMap(([a, b]) => {
+        if (b - a <= perChunkCap) return [[a, b]]
+        const out = []
+        for (let k = a; k < b; k += perChunkCap) out.push([k, Math.min(k + perChunkCap, b)])
+        return out
+      })
+    }
+
+    // maxChunks：超出部分不推理、原样保留（宁可漏改，不可丢文本）
+    let processed = ranges
+    let skippedRanges = []
+    if (this.maxChunks > 0 && ranges.length > this.maxChunks) {
+      processed = ranges.slice(0, this.maxChunks)
+      skippedRanges = ranges.slice(this.maxChunks)
+    }
+    if (this.onChunk && ranges.length > 1) {
+      this.onChunk({
+        total: chars.length,
+        chunks: ranges,
+        processed: processed.length,
+        skipped: skippedRanges.length,
+      })
+    }
+
+    // 逐块推理 + 规则判定；changes/tags 坐标换算回全文
     const out = [...chars]
+    const tags = new Array(chars.length).fill(null)
+    for (const [start, end] of processed) {
+      const seg = chars.slice(start, end)
+      const segTags = await this.#pos(seg)
+      for (let j = 0; j < segTags.length; j++) tags[start + j] = segTags[j]
 
-    for (let i = 0; i < chars.length; i++) {
-      const ch = chars[i]
-      if (!'的地得'.includes(ch)) continue
-      // 已被固定短语规则处理
-      if (changes.some((c) => c.index === i)) continue
+      for (let j = 0; j < seg.length; j++) {
+        const i = start + j // 全文下标
+        const ch = seg[j]
+        if (!'的地得'.includes(ch)) continue
+        // 已被固定短语规则处理
+        if (forcedIdx.has(i)) continue
 
-      // 1) 词汇化例外
-      const frozen = this.#frozenAt(chars, i)
-      if (frozen) continue
-      // 2) 「提及」语境
-      if (isMention(text, i)) continue
-      // 3) 连用防护：与相邻的/地/得 紧挨着，上下文不可靠
-      if (
-        (i > 0 && '的地得'.includes(chars[i - 1])) ||
-        (i + 1 < chars.length && '的地得'.includes(chars[i + 1]))
-      ) continue
+        // 1) 词汇化例外
+        //    DER 解冻：模型基于完整上下文给出 DER（明确的补语判定）时，
+        //    冻结词护栏让路 —— 「打的好啊」里的「打的」不是 taxi 义。
+        //    其余标签（DEG/DEC/SP/VV/AS…）仍冻结，保护 taxi/构词义。
+        //    （冻结词判定用全文 chars，不受块边界影响）
+        const frozen = this.#frozenAt(chars, i)
+        if (frozen && segTags[j] !== 'DER') continue
+        // 2) 「提及」语境（用全文原文判定）
+        if (isMention(text, i)) continue
+        // 3) 连用防护：与相邻的/地/得 紧挨着，上下文不可靠（用全文，跨块接缝也防）
+        if (
+          (i > 0 && '的地得'.includes(chars[i - 1])) ||
+          (i + 1 < chars.length && '的地得'.includes(chars[i + 1]))
+        ) continue
 
-      // 3.5) 邻居规则：的/地/得 后面紧跟名词 → 领属格「的」
-      //      例外：动词 + 得 + 状态名词（说得一口好英语）保留 得
-      const nextTag = neighborTag(chars, tags, i, +1)
-      if (nextTag && NOUN_TAGS.has(nextTag)) {
-        const prevTag = neighborTag(chars, tags, i, -1)
-        const prevWord = i > 0 ? chars[i - 1] : ''
-        // 结果补语「得」：动词 + 得 + 状态名词（说得一口好英语）保留 得
-        // 但状态形容词（饿/累/困）+ 得 + 名词 更可能是领属格
-        const isResultative = (tags[i] === 'DER' || tags[i] === 'AS') &&
-          (prevTag === 'VV' || prevTag === 'VA') &&
-          !STATE_ADJ.has(prevWord)
-        if (!isResultative) {
-          out[i] = '的'
-          if (ch !== '的') {
-            changes.push({ index: i, from: ch, to: '的', tag: tags[i] })
-          }
-          continue
-        }
-      }
-
-      // 3.6) 不及物动词 + 的(DEC) + 就是/是 + 光杆形容词(后面不接的) → 程度补语「得」
-      //      例：他飞的就是高 → 他飞得就是高
-      //      保护：他说的就是对的（形容词后接「的」）、我要的就是快（及物动词）
-      if (tags[i] === 'DEC') {
-        const prevTag = neighborTag(chars, tags, i, -1)
-        const prevWord = i > 0 ? chars[i - 1] : ''
-        if ((prevTag === 'VV' || prevTag === 'VA') && INTRANS_VERBS.has(prevWord)) {
-          const rest = chars.slice(i + 1, i + 4).join('')
-          const adjIdx = rest.startsWith('就是') ? i + 3 : rest.startsWith('是') ? i + 2 : -1
-          if (adjIdx > 0 && adjIdx < chars.length) {
-            const adjTag = tags[adjIdx]
-            const after = adjIdx + 1 < chars.length ? chars[adjIdx + 1] : ''
-            if ((adjTag === 'VA' || adjTag === 'JJ') && after !== '的') {
+        // 3.45) 网络补语「X得一批」（F3）：X的 + 一批（后不接名词）→ X得一批
+        //      必须在邻居规则之前：「一批」的一(CD)/批(M) 会被 NOUN_TAGS 误判，
+        //      先按固定模式救回。保护字面义「猛的一批货」「他猛的一批操作」。
+        if (
+          (segTags[j] === 'DEC' || segTags[j] === 'DEG' || segTags[j] === 'SP') &&
+          j > 0
+        ) {
+          const prevTag = segTags[j - 1]
+          const prevWord = seg[j - 1]
+          const rest = seg.slice(j + 1).join('')
+          if (
+            (DEGREE_ADJ_TAGS.has(prevTag) || SLANG_ADJ.has(prevWord)) &&
+            rest.startsWith('一批')
+          ) {
+            const afterTag = j + 3 < seg.length ? segTags[j + 3] : null
+            if (!afterTag || !NOUN_TAGS.has(afterTag)) {
               out[i] = '得'
-              changes.push({ index: i, from: ch, to: '得', tag: tags[i] })
+              changes.push({ index: i, from: ch, to: '得', tag: segTags[j] })
               continue
             }
           }
         }
-      }
 
-      const to = TAG_TO_CHAR[tags[i]]
-      if (!to || to === ch) continue
-      out[i] = to
-      changes.push({ index: i, from: ch, to, tag: tags[i] })
+        // 3.5) 邻居规则：的/地/得 后面紧跟名词 → 领属格「的」
+        //      例外：动词 + 得 + 状态名词（说得一口好英语）保留 得
+        //      邻居查询在块内做：接缝处按缺邻居处理（略保守，可接受）
+        const nextTag = neighborTag(seg, segTags, j, +1)
+        if (nextTag && NOUN_TAGS.has(nextTag)) {
+          const prevTag = neighborTag(seg, segTags, j, -1)
+          const prevWord = j > 0 ? seg[j - 1] : ''
+          // 结果补语「得」：动词 + 得 + 状态名词（说得一口好英语）保留 得
+          // 但状态形容词（饿/累/困）+ 得 + 名词 更可能是领属格
+          const isResultative = (segTags[j] === 'DER' || segTags[j] === 'AS') &&
+            (prevTag === 'VV' || prevTag === 'VA') &&
+            !STATE_ADJ.has(prevWord)
+          if (!isResultative) {
+            out[i] = '的'
+            if (ch !== '的') {
+              changes.push({ index: i, from: ch, to: '的', tag: segTags[j] })
+            }
+            continue
+          }
+        }
+
+        // 3.6) 不及物动词 + 的(DEC) + 就是/是 + 光杆形容词(后面不接的) → 程度补语「得」
+        //      例：他飞的就是高 → 他飞得就是高
+        //      保护：他说的就是对的（形容词后接「的」）、我要的就是快（及物动词）
+        if (segTags[j] === 'DEC') {
+          const prevTag = neighborTag(seg, segTags, j, -1)
+          const prevWord = j > 0 ? seg[j - 1] : ''
+          if ((prevTag === 'VV' || prevTag === 'VA') && INTRANS_VERBS.has(prevWord)) {
+            const rest = seg.slice(j + 1, j + 4).join('')
+            const adjIdx = rest.startsWith('就是') ? j + 3 : rest.startsWith('是') ? j + 2 : -1
+            if (adjIdx > 0 && adjIdx < seg.length) {
+              const adjTag = segTags[adjIdx]
+              const after = adjIdx + 1 < seg.length ? seg[adjIdx + 1] : ''
+              if ((adjTag === 'VA' || adjTag === 'JJ') && after !== '的') {
+                out[i] = '得'
+                changes.push({ index: i, from: ch, to: '得', tag: segTags[j] })
+                continue
+              }
+            }
+          }
+        }
+
+        // 3.7) 程度补语固定后缀（F1）：X的 + 离谱/要死/犯规… → X得…
+        //      仅在标签不可靠（DEG/SP/DEC）时强改；前字须为 VA/JJ/VV 或俚语字表
+        //      （「菜」被模型判 NN，只靠标签救不了 M1）。
+        if (
+          (segTags[j] === 'DEG' || segTags[j] === 'SP' || segTags[j] === 'DEC') &&
+          j > 0
+        ) {
+          const prevTag = segTags[j - 1]
+          const prevWord = seg[j - 1]
+          const suffix = seg.slice(j + 1, j + 5).join('')
+          if (
+            (DEGREE_ADJ_TAGS.has(prevTag) || SLANG_ADJ.has(prevWord)) &&
+            DEGREE_SUFFIXES.some((s) => suffix.startsWith(s))
+          ) {
+            out[i] = '得'
+            changes.push({ index: i, from: ch, to: '得', tag: segTags[j] })
+            continue
+          }
+        }
+
+        const to = TAG_TO_CHAR[segTags[j]]
+        if (!to || to === ch) continue
+        out[i] = to
+        changes.push({ index: i, from: ch, to, tag: segTags[j] })
+      }
     }
 
     let corrected = out.join('')
     // 4) 防重复字：改完出现原文没有的「地地/得得/的的」→ 回退
+    //    （全局做：跨块接缝产生的重复也能兜住）
     corrected = this.#undoDuplicate(chars, [...corrected])
-    return { text, corrected, changes, tags }
+    const result = { text, corrected, changes, tags }
+    if (ranges.length > 1) {
+      result.chunkInfo = { chunks: ranges, processed: processed.length, skipped: skippedRanges.length }
+    }
+    return result
   }
 
   /** 纠错后的文本 */

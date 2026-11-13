@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-dedide-ercorrection",
   "description": "中文「的/地/得」混用纠错 for Koishi：内置本地 ONNX 模型，无需联网、无需 LLM，@人/表情占位符保留",
-  "version": "0.3.1",
+  "version": "0.3.3",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

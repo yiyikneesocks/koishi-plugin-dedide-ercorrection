@@ -24,6 +24,7 @@ export const inject = []          // 不再需要 jieba
 
 export interface Config {
   maxLength?: number
+  maxTotalLength?: number
   verbose?: boolean
   replyMode?: 'plain' | 'quote' | 'auto'
   fullTextThreshold?: number
@@ -32,8 +33,11 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   maxLength: Schema.number()
-    .description('超过此长度的消息不处理（0=不限制）')
+    .description('单块上限：分块推理时每块的最大码点数（0=不限制）；不是全文上限')
     .default(500).min(0),
+  maxTotalLength: Schema.number()
+    .description('全文熔断：超过此码点数的消息整条原样放行不推理（0=不限制）')
+    .default(2000).min(0),
   verbose: Schema.boolean()
     .description('记录每次修改')
     .default(false),
@@ -137,11 +141,22 @@ function markChanges(
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('dedide-ercorrection')
   const maxLength = config.maxLength ?? 500
+  const maxTotalLength = config.maxTotalLength ?? 2000
   const replyMode = config.replyMode ?? 'auto'
   const fullThreshold = config.fullTextThreshold ?? 100
   const ctxLen = config.quoteContextChars ?? 20
 
-  const corrector = new DeCorrector({ maxLength })
+  const corrector = new DeCorrector({
+    maxLength,
+    maxTotalLength,
+    // 分块观测：只在真实分块时调用，拼进一条日志避免刷屏
+    onChunk: (info) => {
+      if (config.verbose) {
+        logger.info('[chunk] total=%d chunks=%d processed=%d skipped=%d',
+          info.total, info.chunks.length, info.processed, info.skipped)
+      }
+    },
+  })
 
   // 预热：不阻塞插件注册；失败只告警，机器人照常工作
   let ready = false
@@ -152,15 +167,16 @@ export function apply(ctx: Context, config: Config) {
 
   // ── 统计 ──
   const stats = {
-    messages: 0,  // 含 的地得 且通过长度检查的消息数
+    messages: 0,  // 含 的地得 且通过熔断检查的消息数
     fixed: 0,     // 实际改动的消息数
     skipped: 0,   // 检查后无需改动
+    oversize: 0,  // 超全文熔断被放行（不推理）的消息数
     errors: 0,    // 处理异常
   }
 
   const dumpStats = () => {
-    logger.info('[stats] msgs=%d fixed=%d skipped=%d err=%d',
-      stats.messages, stats.fixed, stats.skipped, stats.errors)
+    logger.info('[stats] msgs=%d fixed=%d skipped=%d oversize=%d err=%d',
+      stats.messages, stats.fixed, stats.skipped, stats.oversize, stats.errors)
   }
   ctx.setInterval(dumpStats, 60000)
   ;(ctx as any).on('dispose', dumpStats)
@@ -174,7 +190,15 @@ export function apply(ctx: Context, config: Config) {
   } | null> {
     if (!content || content.length <= 2) return null
     if (!/[的地得]/.test(content)) return null
-    if (maxLength > 0 && Array.from(content).length > maxLength) return null
+
+    const charLen = Array.from(content).length
+    // 全文熔断：超过 maxTotalLength 整条放行（引擎同样有此保护，这里前置省一次调用）。
+    // 严禁静默丢弃——必须计数+日志（2026-11-13 长消息事故的根源就是静默 return null）。
+    if (maxTotalLength > 0 && charLen > maxTotalLength) {
+      stats.oversize++
+      logger.info('[oversize] len=%d > maxTotalLength=%d, skip inference (kept verbatim)', charLen, maxTotalLength)
+      return null
+    }
     if (!ready) return null
 
     stats.messages++
