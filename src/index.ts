@@ -1,10 +1,13 @@
 //index.ts
-// 「的/地/得」纠正 —— 本地 ONNX 词性模型（@azulores/de-corrector）
+// 「的/地/得」纠正 —— 本地 ONNX 词性模型
 //
 // 原理：HanLP CTB 词性模型导出为 ONNX，CTB 词性集给 的/地/得 设有专属标签：
 //   DEV → 地（状语）  DER → 得（补语）  DEG / DEC / SP → 的
 // 模型判的是**语法槽位**，即使原文写错字也照样给出正确标签，所以
 // 纠错 = 把标签映射回汉字。全程本地、无网络、无 Python、无分词器。
+//
+// 纠错核心（原 @azulores/de-corrector，2026-11-13 合并进来，npm 上该包已弃用）
+// 位于 src/corrector/de-corrector.js，模型资产在 assets/（随 npm 包发布）。
 //
 // 本插件只负责「接进 Koishi」：占位符保护、长度守卫、中间件挂载。
 // 回复形式（replyMode）：
@@ -14,7 +17,7 @@
 //             长消息：引用原消息 + 只发错误位置上下文片段（错误处标 [地→的]，
 //             相邻错误（≤ quoteContextChars）自动合并为一段，不会隐藏）
 import { Schema, Context, Session, h } from 'koishi'
-import { DeCorrector } from '@azulores/de-corrector'
+import { DeCorrector } from './corrector/de-corrector.js'
 
 export const name = 'dedide-ercorrection'
 export const inject = []          // 不再需要 jieba
