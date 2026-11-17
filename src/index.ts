@@ -21,7 +21,8 @@ import { DeCorrector } from './corrector/de-corrector.js'
 import { ensureSegmenter, filterByWordBoundary, segmenterState } from './word-boundary.js'
 
 export const name = 'dedide-ercorrection'
-export const inject = []          // 不再需要 jieba
+// 词边界护栏需要分词服务（由 jieba / hanlpjieba 任一 provider 提供）。
+export const inject = ['jieba']
 
 export interface Config {
   maxLength?: number
@@ -183,14 +184,15 @@ export function apply(ctx: Context, config: Config) {
     (e: any) => logger.warn('model load failed: %s', e?.message ?? e),
   )
 
-  // 词边界护栏的分词器：同样是懒加载 + 失败降级（不阻塞启动、不影响纠错）
+  // 词边界护栏的分词器：直接用 jieba 服务（provider 决定同步/异步）。
+  // 失败降级为「不过滤」，绝不影响纠错本身。
   const wordBoundary = config.wordBoundary !== false
   if (wordBoundary) {
-    ensureSegmenter(() => import('@azulores/jieba-hanlp')).then((ok) => {
-      if (ok) logger.info('word-boundary guard ready (jieba-hanlp tokenizer)')
-      else logger.warn('word-boundary guard unavailable, corrections run without it: %s',
-        segmenterState().error ?? 'unknown')
-    })
+    ensureSegmenter((ctx as any).jieba)
+    const state = segmenterState()
+    if (state.available) logger.info('word-boundary guard ready (jieba service)')
+    else logger.warn('word-boundary guard unavailable, corrections run without it: %s',
+      state.error ?? 'unknown')
   }
 
   // ── 统计 ──

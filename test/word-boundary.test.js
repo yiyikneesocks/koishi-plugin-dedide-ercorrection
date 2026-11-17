@@ -4,7 +4,7 @@
 // 跑法：node --test test/word-boundary.test.js
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { __setSegmenter, filterByWordBoundary } from '../lib/word-boundary.js'
+import { __setSegmenter, ensureSegmenter, segmenterState, filterByWordBoundary } from '../lib/word-boundary.js'
 
 /** 用「词表最长匹配」造一个假分词器，足够验证门控逻辑本身 */
 function fakeSegmenter(vocab) {
@@ -96,4 +96,41 @@ test('多改动混合：只挡词内的', async () => {
   const kept = await filterByWordBoundary(text, changes)
   assert.equal(kept.length, 1)
   assert.equal(kept[0].index, 11)
+})
+
+// ─────────────────────────────────────────────────────────────
+// provider 能力探测：护栏只接受带 cutWithOffset() 的服务
+// ─────────────────────────────────────────────────────────────
+
+test('provider 有 cutWithOffset：护栏启用', () => {
+  ensureSegmenter({
+    async cutWithOffset() { return [] },
+  })
+  assert.deepEqual(segmenterState(), { available: true, error: null })
+})
+
+test('provider 只有 cut()：护栏停用并给出原因', () => {
+  // @node-rs/jieba 就是这种 provider：词典把「跑的快」整体当一个词，
+  // 用 cut() 算偏移会把真正该改的助词误判成词内构字，所以必须拒绝。
+  ensureSegmenter({
+    cut() { return ['跑的快'] },
+  })
+  const state = segmenterState()
+  assert.equal(state.available, false)
+  assert.match(state.error, /cutWithOffset/)
+})
+
+test('provider 缺失：护栏停用，纠错降级放行', async () => {
+  ensureSegmenter(null)
+  assert.equal(segmenterState().available, false)
+  const changes = [{ index: 0, from: '地', to: '的' }]
+  assert.deepEqual(await filterByWordBoundary('地幔深处', changes), changes)
+})
+
+test('无 cutWithOffset 的 provider 不会用 cut() 近似（防回归）', async () => {
+  // 模拟词典分词器：cut() 把「跑的快」当一个词。
+  // 若实现改用 cut() 近似，这里的「的」会被误挡 → 本测试失败。
+  ensureSegmenter({ cut() { return ['跑的快'] } })
+  const kept = await filterByWordBoundary('他跑的快', [{ index: 2, from: '的', to: '得' }])
+  assert.equal(kept.length, 1)
 })
