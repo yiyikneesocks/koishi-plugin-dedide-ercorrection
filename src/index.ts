@@ -18,6 +18,7 @@
 //             相邻错误（≤ quoteContextChars）自动合并为一段，不会隐藏）
 import { Schema, Context, Session, h } from 'koishi'
 import { DeCorrector } from './corrector/de-corrector.js'
+import { ensureSegmenter, filterByWordBoundary, segmenterState } from './word-boundary.js'
 
 export const name = 'dedide-ercorrection'
 export const inject = []          // 不再需要 jieba
@@ -25,6 +26,7 @@ export const inject = []          // 不再需要 jieba
 export interface Config {
   maxLength?: number
   maxTotalLength?: number
+  wordBoundary?: boolean
   verbose?: boolean
   replyMode?: 'plain' | 'quote' | 'auto'
   fullTextThreshold?: number
@@ -38,6 +40,9 @@ export const Config: Schema<Config> = Schema.object({
   maxTotalLength: Schema.number()
     .description('全文熔断：超过此码点数的消息整条原样放行不推理（0=不限制）')
     .default(2000).min(0),
+  wordBoundary: Schema.boolean()
+    .description('用分词器核对词边界：的/地/得 落在多字词内部（地幔、得手、得票）时跳过，避免把构词成分当助词改（默认开启）')
+    .default(true),
   verbose: Schema.boolean()
     .description('记录每次修改')
     .default(false),
@@ -86,6 +91,19 @@ function contentToText(content: any): string {
 }
 
 interface Change { index: number; from: string; to: string; tag?: string }
+
+/**
+ * 按改动表重建文本（码点语义，与引擎 index 一致）。
+ * 只在词边界护栏裁掉部分改动后使用；改动是等长替换，长度恒等于原文。
+ */
+function applyChanges(clean: string, changes: Change[]): string {
+  if (!changes.length) return clean
+  const chars = Array.from(clean)
+  for (const c of [...changes].sort((a, b) => a.index - b.index)) {
+    if (c.index >= 0 && c.index < chars.length) chars[c.index] = c.to
+  }
+  return chars.join('')
+}
 
 /**
  * 长消息片段：把 changes（按 clean 文本的码点 index）按相邻关系分组，
@@ -165,18 +183,29 @@ export function apply(ctx: Context, config: Config) {
     (e: any) => logger.warn('model load failed: %s', e?.message ?? e),
   )
 
+  // 词边界护栏的分词器：同样是懒加载 + 失败降级（不阻塞启动、不影响纠错）
+  const wordBoundary = config.wordBoundary !== false
+  if (wordBoundary) {
+    ensureSegmenter(() => import('@azulores/jieba-hanlp')).then((ok) => {
+      if (ok) logger.info('word-boundary guard ready (jieba-hanlp tokenizer)')
+      else logger.warn('word-boundary guard unavailable, corrections run without it: %s',
+        segmenterState().error ?? 'unknown')
+    })
+  }
+
   // ── 统计 ──
   const stats = {
     messages: 0,  // 含 的地得 且通过熔断检查的消息数
     fixed: 0,     // 实际改动的消息数
     skipped: 0,   // 检查后无需改动
     oversize: 0,  // 超全文熔断被放行（不推理）的消息数
+    gated: 0,     // 被词边界护栏挡下的改动点数（词内构字，如 地幔/得手）
     errors: 0,    // 处理异常
   }
 
   const dumpStats = () => {
-    logger.info('[stats] msgs=%d fixed=%d skipped=%d oversize=%d err=%d',
-      stats.messages, stats.fixed, stats.skipped, stats.oversize, stats.errors)
+    logger.info('[stats] msgs=%d fixed=%d skipped=%d oversize=%d gated=%d err=%d',
+      stats.messages, stats.fixed, stats.skipped, stats.oversize, stats.gated, stats.errors)
   }
   ctx.setInterval(dumpStats, 60000)
   ;(ctx as any).on('dispose', dumpStats)
@@ -214,6 +243,28 @@ export function apply(ctx: Context, config: Config) {
       stats.errors++
       logger.warn('correction failed: %s', e?.message ?? e)
       return null
+    }
+
+    // 词边界护栏：丢掉「落在多字词内部」的改动（地幔/得手/得票 这类构词成分）。
+    // 只在有改动时才算，且分词器不可用时原样放行（降级）。
+    if (wordBoundary && checked.changes?.length) {
+      try {
+        const kept = await filterByWordBoundary(clean, checked.changes)
+        if (kept.length !== checked.changes.length) {
+          stats.gated += checked.changes.length - kept.length
+          if (config.verbose) {
+            logger.info('[gate] blocked %d change(s) inside multi-char words',
+              checked.changes.length - kept.length)
+          }
+          checked = {
+            corrected: applyChanges(clean, kept),
+            changes: kept,
+          }
+        }
+      } catch (e: any) {
+        // 护栏异常绝不影响纠错：保持引擎原结果
+        logger.warn('word-boundary filter failed, using engine result: %s', e?.message ?? e)
+      }
     }
 
     if (checked.corrected === clean) {

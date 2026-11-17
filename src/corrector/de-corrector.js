@@ -130,6 +130,20 @@ export const FROZEN_WORDS = [
 
 const PUNCT = '，。！？；：、“”‘’（）《》〈〉【】…—～,.!?;:\'"()[]{}<>-~ \n\t\r'
 
+/**
+ * 能接在「真」前构成形容词/名词的字（认真/天真/较真/当真/纯真/逼真…）。
+ *
+ * 冻结词是**子串**匹配（JS 端不分词），「认真的说」里的「真的」会被误判成
+ * 副词「真的」而整处冻结。这类「X真 的」中的「的」属于 X真 这个整体，
+ * 应由模型标签（DEV→地 / DEC→的）决定，必须放行。
+ */
+const ZHEN_WORD_PREFIX = new Set([...'认天较当纯逼传写失乱归'])
+
+/** 「真的」的命中是否只是子串误命中（前字与其构成 认真/天真…） */
+function isZhenFalseMatch(chars, zhenStart) {
+  return zhenStart > 0 && ZHEN_WORD_PREFIX.has(chars[zhenStart - 1])
+}
+
 /** 噪声阈值 */
 const NOISE_MIN_ALNUM = 2
 const NOISE_DE_RATIO = 0.6
@@ -495,7 +509,11 @@ export class DeCorrector {
         //    其余标签（DEG/DEC/SP/VV/AS…）仍冻结，保护 taxi/构词义。
         //    （冻结词判定用全文 chars，不受块边界影响）
         const frozen = this.#frozenAt(chars, i)
-        if (frozen && segTags[j] !== 'DER') continue
+        // 「真的」子串误命中（认真的/天真的/较真的…）→ 不冻结，交给后续规则
+        const zhenFalse =
+          frozen === '真的' &&
+          isZhenFalseMatch(chars, i - 1) // i 是「的」，「真的」从 i-1 开始
+        if (frozen && !zhenFalse && segTags[j] !== 'DER') continue
         // 2) 「提及」语境（用全文原文判定）
         if (isMention(text, i)) continue
         // 3) 连用防护：与相邻的/地/得 紧挨着，上下文不可靠（用全文，跨块接缝也防）
